@@ -48,7 +48,8 @@ public class MonetaMod implements ModInitializer {
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
 			UUID id = handler.player.getUUID();
 			names.put(id, handler.player.getGameProfile().name());
-			updateDisplay(server);
+			LOG.info("Moneta: {} joined, updating display", handler.player.getGameProfile().name());
+			showMoney(handler.player);
 		});
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registries, environment) -> {
@@ -89,8 +90,6 @@ public class MonetaMod implements ModInitializer {
 			LOG.error("Moneta: could not create data dir: {}", e.toString());
 		}
 		load();
-		ensureObjective(server);
-		updateDisplay(server);
 		LOG.info("Moneta ready. Total in circulation: {}", totalMoney());
 	}
 
@@ -162,30 +161,25 @@ public class MonetaMod implements ModInitializer {
 
 	/* ---------- scoreboard display (top-right) ---------- */
 
-	private void ensureObjective(MinecraftServer server) {
-		net.minecraft.world.scores.Scoreboard sb = server.getScoreboard();
-		net.minecraft.world.scores.Objective obj = sb.getObjective(OBJECTIVE);
-		if (obj == null) {
-			obj = sb.addObjective(OBJECTIVE,
-					net.minecraft.world.scores.criteria.ObjectiveCriteria.DUMMY,
-					Component.literal("Moneta"),
-					net.minecraft.world.scores.criteria.ObjectiveCriteria.RenderType.INTEGER,
-					false, null);
-		}
-		sb.setDisplayObjective(net.minecraft.world.scores.DisplaySlot.SIDEBAR, obj);
-	}
-
-	private void updateDisplay(MinecraftServer server) {
-		ensureObjective(server);
-		net.minecraft.world.scores.Scoreboard sb = server.getScoreboard();
-		net.minecraft.world.scores.Objective obj = sb.getObjective(OBJECTIVE);
-		if (obj == null) return;
-		for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-			net.minecraft.world.scores.ScoreAccess access = sb.getOrCreatePlayerScore(p, obj);
-			long bal = getBalance(p.getUUID());
-			access.set((int) Math.min(bal, Integer.MAX_VALUE));
-			names.put(p.getUUID(), p.getGameProfile().name());
-		}
+	private void showMoney(ServerPlayer p) {
+		String objName = OBJECTIVE;
+		net.minecraft.world.scores.Scoreboard dummy = new net.minecraft.world.scores.Scoreboard();
+		net.minecraft.world.scores.Objective obj = new net.minecraft.world.scores.Objective(
+				dummy, objName, net.minecraft.world.scores.criteria.ObjectiveCriteria.DUMMY,
+				Component.literal("Moneta"),
+				net.minecraft.world.scores.criteria.ObjectiveCriteria.RenderType.INTEGER, false, null);
+		p.connection.send(new net.minecraft.network.protocol.game.ClientboundSetObjectivePacket(obj,
+				net.minecraft.network.protocol.game.ClientboundSetObjectivePacket.METHOD_ADD));
+		p.connection.send(new net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket(
+				net.minecraft.world.scores.DisplaySlot.SIDEBAR, obj));
+		long bal = getBalance(p.getUUID());
+		int score = (int) Math.min(bal, Integer.MAX_VALUE);
+		p.connection.send(new net.minecraft.network.protocol.game.ClientboundSetScorePacket(
+				p.getGameProfile().name(), objName, score,
+				java.util.Optional.of(net.minecraft.network.chat.Component.literal(p.getGameProfile().name())),
+				java.util.Optional.of(new net.minecraft.network.chat.numbers.FixedFormat(
+						net.minecraft.network.chat.Component.literal("$" + bal).withStyle(net.minecraft.ChatFormatting.GREEN)))));
+		names.put(p.getUUID(), p.getGameProfile().name());
 	}
 
 	/* ---------- commands ---------- */
@@ -230,7 +224,8 @@ public class MonetaMod implements ModInitializer {
 		setBalance(sender.getUUID(), senderBal - amount);
 		setBalance(target.getUUID(), getBalance(target.getUUID()) + amount);
 		save();
-		updateDisplay(src.getServer());
+		showMoney(sender);
+		showMoney(target);
 		src.sendSuccess(() -> Component.literal("Inviati " + amount + " a " + target.getGameProfile().name()
 				+ ". Nuovo saldo: " + getBalance(sender.getUUID())), false);
 		target.sendSystemMessage(Component.literal(sender.getGameProfile().name() + " ti ha inviato " + amount
@@ -258,7 +253,7 @@ public class MonetaMod implements ModInitializer {
 			setBalance(p.getUUID(), getBalance(p.getUUID()) + add);
 		}
 		save();
-		updateDisplay(server);
+		for (ServerPlayer p : players) showMoney(p);
 		src.sendSuccess(() -> Component.literal("Zecca: messi in circolazione " + amount
 				+ " (totale ora: " + totalMoney() + "), distribuiti a " + players.size() + " giocatori."), true);
 		for (ServerPlayer p : players) {
