@@ -1,25 +1,55 @@
 # Moneta
 
-Mod di valuta **server-side** per Minecraft **26.3** (Fabric). Non richiede l'installazione sul client: aggiunge saldi persistenti, pagamenti anche verso giocatori offline, comandi amministrativi, registro delle transazioni e configurazione.
+**Moneta** is a **server-side** currency mod for **Minecraft 26.3** (Fabric).  
+It does not need to be installed on clients: it adds persistent balances, payments to online and offline players, administrative commands, a transaction log, configuration, and an automatic monetary policy.
 
-## Comandi
+## Features
 
-| Comando | Descrizione |
+- Persistent per-player balances stored in the world folder.
+- Payments between online and offline players.
+- State mint with cooldown and daily limit.
+- Automatic monetary regulation to limit inflation and preserve currency value.
+- Transaction tax that burns a percentage of every transfer.
+- Maximum balance cap.
+- Economy overview with circulation total and top balances.
+- Administrative commands for setting, taking, and auditing balances.
+- JSON configuration with sensible defaults.
+- Atomic saves on a background thread.
+- No HUD: balances are shown only through commands.
+
+## Requirements
+
+- Minecraft `26.3`
+- Fabric Loader `0.20.1` or newer
+- Fabric API `0.165.0+26.3` or newer
+- Java `25` or newer
+- Server environment only
+
+## Installation
+
+1. Install Fabric Loader and Fabric API on your server.
+2. Place the Moneta jar in the `mods` folder.
+3. Start the server once to generate `config/moneta.json`.
+4. Adjust the configuration if needed and restart.
+
+## Commands
+
+| Command | Description |
 |---|---|
-| `/balance` | Mostra il tuo saldo. |
-| `/balance <player>` | Mostra il saldo di un giocatore, anche offline. |
-| `/send <player> <amount>` | Invia denaro a un giocatore online o offline. |
-| `/mint <amount>` | Crea denaro e lo distribuisce ai giocatori online. |
-| `/economy [limit]` | Mostra il totale in circolazione e i saldi più alti. |
-| `/setbalance <player> <amount>` | Imposta il saldo di un giocatore (admin). |
-| `/takebalance <player> <amount>` | Rimuove denaro dal saldo di un giocatore (admin). |
-| `/transactions [player] [limit]` | Mostra le ultime transazioni (admin). |
+| `/balance` | Shows your balance. |
+| `/balance <player>` | Shows the balance of a player, including offline players. |
+| `/send <player> <amount>` | Sends money to an online or offline player. |
+| `/mint <amount>` | Creates money and distributes it to online players. |
+| `/economy [limit]` | Shows total circulation and the highest balances. |
+| `/setbalance <player> <amount>` | Sets a player's balance. Admin only. |
+| `/takebalance <player> <amount>` | Removes money from a player's balance. Admin only. |
+| `/transactions [player] [limit]` | Shows recent transactions. Admin only. |
 
-Gli importi sono interi (`long`), senza decimali. I nomi dei giocatori offline vengono risolti tramite la cache profili del server (`usercache.json`).
+Amounts are integers (`long`), without decimals.
 
-## Configurazione
+## Configuration
 
-Il file viene creato automaticamente in `config/moneta.json`:
+The file is created automatically at `config/moneta.json`:
 
 ```json
 {
@@ -29,37 +59,62 @@ Il file viene creato automaticamente in `config/moneta.json`:
   "economyTopLimit": 10,
   "economyMaxLimit": 100,
   "transactionLogLimit": 1000,
-  "autosaveSeconds": 30
+  "autosaveSeconds": 30,
+  "regulationEnabled": true,
+  "targetBalancePerPlayer": 1000,
+  "regulationIntervalSeconds": 300,
+  "regulationTolerancePercent": 10,
+  "regulationRatePercent": 2,
+  "transactionTaxPercent": 1,
+  "maxBalance": 100000,
+  "mintCooldownSeconds": 60,
+  "mintDailyLimit": 100000
 }
 ```
 
-- `currencySymbol`: simbolo mostrato nei messaggi.
-- `startingBalance`: saldo iniziale dei nuovi giocatori.
-- `adminPermission`: permesso richiesto dai comandi admin (`moderator`, `gamemaster`, `admin`, `owner`).
-- `economyTopLimit`: numero di giocatori mostrati da `/economy` senza argomento.
-- `economyMaxLimit`: limite massimo richiedibile con `/economy <limit>`.
-- `transactionLogLimit`: numero massimo di transazioni conservate.
-- `autosaveSeconds`: intervallo di salvataggio automatico; `0` salva subito dopo ogni modifica.
+### General settings
 
-### Politica monetaria
-- `regulationEnabled`: abilita la regolazione automatica della massa monetaria.
-- `targetBalancePerPlayer`: saldo medio desiderato per account noto.
-- `regulationIntervalSeconds`: intervallo tra due regolazioni automatiche.
-- `regulationTolerancePercent`: scarto percentuale consentito prima di intervenire.
-- `regulationRatePercent`: intensità della correzione (creazione o bruciatura).
-- `transactionTaxPercent`: tassa percentuale applicata ai trasferimenti.
-- `maxBalance`: saldo massimo per account; `0` disabilita il limite.
-- `mintCooldownSeconds`: raffreddamento del comando `/mint`.
-- `mintDailyLimit`: limite giornaliero del comando `/mint`; `0` disabilita.
+- `currencySymbol`: symbol shown in messages.
+- `startingBalance`: initial balance for new players.
+- `adminPermission`: permission required by admin commands. Accepted values: `moderator`, `gamemaster`, `admin`, `owner`.
+- `economyTopLimit`: number of players shown by `/economy` without an argument.
+- `economyMaxLimit`: maximum value accepted by `/economy <limit>`.
+- `transactionLogLimit`: maximum number of transactions stored.
+- `autosaveSeconds`: automatic save interval. `0` saves immediately after every change.
 
-## Dati
+### Monetary policy
 
-I dati sono salvati nella cartella del mondo:
+- `regulationEnabled`: enables automatic monetary regulation.
+- `targetBalancePerPlayer`: desired average balance per known account.
+- `regulationIntervalSeconds`: time between automatic regulations.
+- `regulationTolerancePercent`: allowed deviation before the system intervenes.
+- `regulationRatePercent`: strength of automatic creation or burning.
+- `transactionTaxPercent`: percentage burned on every transfer.
+- `maxBalance`: maximum balance per account. `0` disables the cap.
+- `mintCooldownSeconds`: cooldown for `/mint`.
+- `mintDailyLimit`: daily limit for `/mint`. `0` disables the limit.
 
-- `world/moneta/balances.json` — saldi e nomi dei giocatori.
-- `world/moneta/transactions.json` — registro delle transazioni.
+## Monetary policy
 
-I salvataggi usano scritture atomiche (file temporaneo + rename) e avvengono in un thread separato per non bloccare il thread principale del server.
+Moneta includes a self-regulating monetary system:
+
+- It calculates a **target money supply** from `targetBalancePerPlayer` and the number of known accounts.
+- If the supply is **too low**, the mint creates money and distributes it to online players.
+- If the supply is **too high**, it burns a percentage of the excess from balances above the per-player target.
+- Every transfer pays a **transaction tax**, which is burned and removed from circulation.
+- Balances cannot exceed `maxBalance`.
+- `/mint` is protected by a cooldown and a daily limit.
+
+This keeps the currency from losing value through uncontrolled inflation while still allowing the economy to grow with the player base.
+
+## Data
+
+Data is stored in the world folder:
+
+- `world/moneta/balances.json` — player balances and names.
+- `world/moneta/transactions.json` — transaction history.
+
+Saves use atomic file writes and are performed on a background thread to avoid blocking the server thread.
 
 ## Build
 
@@ -67,4 +122,8 @@ I salvataggi usano scritture atomiche (file temporaneo + rename) e avvengono in 
 ./gradlew build
 ```
 
-Il jar viene creato in `build/libs/`.
+The jar is created in `build/libs/`.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
