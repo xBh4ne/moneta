@@ -44,6 +44,7 @@ public class MonetaMod implements ModInitializer {
 
 	private MinecraftServer server;
 	private MonetaConfig config;
+	private Path configPath;
 	private EconomyStore store;
 	private long lastAutosave;
 
@@ -68,10 +69,8 @@ public class MonetaMod implements ModInitializer {
 
 	private void start(MinecraftServer startedServer) {
 		server = startedServer;
-		config = MonetaConfig.load(
-			startedServer.getFile("config").resolve("moneta.json"),
-			LOG
-		);
+		configPath = startedServer.getFile("config").resolve("moneta.json");
+		config = MonetaConfig.load(configPath, LOG);
 
 		Path dataDirectory = startedServer
 			.getWorldPath(LevelResource.ROOT)
@@ -183,6 +182,43 @@ public class MonetaMod implements ModInitializer {
 								context.getSource(),
 								IntegerArgumentType.getInteger(context, "limit")
 							)
+					)
+				)
+		);
+
+		dispatcher.register(
+			Commands.literal("treasury").executes(context ->
+				showTreasury(context.getSource())
+			)
+		);
+
+		dispatcher.register(
+			Commands.literal("settax")
+				.requires(this::isAdmin)
+				.then(
+					Commands.argument("percent", IntegerArgumentType.integer(0, 100)).executes(
+						context ->
+							setTax(
+								context.getSource(),
+								IntegerArgumentType.getInteger(context, "percent")
+							)
+					)
+				)
+		);
+
+		dispatcher.register(
+			Commands.literal("treasurypay")
+				.requires(this::isAdmin)
+				.then(
+					playerArgument("player").then(
+						Commands.argument("amount", LongArgumentType.longArg(1L)).executes(
+							context ->
+								payFromTreasury(
+									context.getSource(),
+									StringArgumentType.getString(context, "player"),
+									LongArgumentType.getLong(context, "amount")
+								)
+						)
 					)
 				)
 		);
@@ -381,6 +417,7 @@ public class MonetaMod implements ModInitializer {
 
 		long newSenderBalance = store.debit(sender.getUUID(), totalCost);
 		long newTargetBalance = store.credit(target.id(), amount);
+		if (fee > 0L) store.creditTreasury(fee);
 		store.log(
 			"SEND",
 			sender.getUUID(),
@@ -566,6 +603,116 @@ public class MonetaMod implements ModInitializer {
 				"%)";
 			source.sendSuccess(() -> Component.literal(line), false);
 			rank++;
+		}
+		return 1;
+	}
+
+	private int showTreasury(CommandSourceStack source) {
+		if (store == null || config == null) return 0;
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Saldo della zecca: " +
+						config.money(store.treasuryBalance()) +
+						" (tassa: " +
+						config.transactionTaxPercent +
+						"%)"
+				),
+			false
+		);
+		return 1;
+	}
+
+	private int setTax(CommandSourceStack source, int percent) {
+		if (config == null || configPath == null) return 0;
+		config.transactionTaxPercent = percent;
+		MonetaConfig.save(config, configPath, LOG);
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Tassa sulle transazioni impostata a " + percent + "%."
+				),
+			true
+		);
+		return 1;
+	}
+
+	private int payFromTreasury(
+		CommandSourceStack source,
+		String targetName,
+		long amount
+	) {
+		if (store == null || server == null) return 0;
+		if (amount <= 0L) {
+			source.sendFailure(
+				Component.literal("L'importo deve essere maggiore di zero.")
+			);
+			return 0;
+		}
+		Optional<NameAndId> resolved = resolve(targetName);
+		if (resolved.isEmpty()) {
+			source.sendFailure(
+				Component.literal("Giocatore non trovato: " + targetName + ".")
+			);
+			return 0;
+		}
+		NameAndId target = resolved.get();
+		String resolvedTargetName = nameOf(target);
+		store.ensureAccount(target.id(), resolvedTargetName);
+
+		if (store.treasuryBalance() < amount) {
+			source.sendFailure(
+				Component.literal(
+					"Saldo della zecca insufficiente: " +
+						config.money(store.treasuryBalance())
+				)
+			);
+			return 0;
+		}
+		if (!store.canCredit(target.id(), amount)) {
+			source.sendFailure(
+				Component.literal("Il destinatario ha raggiunto il saldo massimo.")
+			);
+			return 0;
+		}
+
+		store.debitTreasury(amount);
+		long newBalance = store.credit(target.id(), amount);
+		store.log(
+			"TREASURY",
+			source.getPlayer() == null ? null : source.getPlayer().getUUID(),
+			source.getTextName(),
+			target.id(),
+			resolvedTargetName,
+			amount,
+			newBalance,
+			0L
+		);
+		persistMaybe();
+
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Pagati " +
+						config.money(amount) +
+						" dal tesoro a " +
+						resolvedTargetName +
+						". Nuovo saldo: " +
+						config.money(newBalance) +
+						"."
+				),
+			true
+		);
+		ServerPlayer onlineTarget = server.getPlayerList().getPlayer(target.id());
+		if (onlineTarget != null) {
+			onlineTarget.sendSystemMessage(
+				Component.literal(
+					"Hai ricevuto " +
+						config.money(amount) +
+						" dal tesoro. Nuovo saldo: " +
+						config.money(newBalance)
+				)
+			);
 		}
 		return 1;
 	}
@@ -770,6 +917,9 @@ public class MonetaMod implements ModInitializer {
 				config.money(transaction.balanceAfter()) + ")";
 			case "REGULATE" -> when + " REGULATE -> Economia: " +
 				config.money(transaction.amount()) + " (totale: " +
+				config.money(transaction.balanceAfter()) + ")";
+			case "TREASURY" -> when + " TREASURY -> " + target + ": " +
+				config.money(transaction.amount()) + " (saldo: " +
 				config.money(transaction.balanceAfter()) + ")";
 			default -> when + " " + transaction.type() + " " + actor + " -> " +
 				target + ": " + config.money(transaction.amount());

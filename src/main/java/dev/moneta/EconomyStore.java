@@ -40,6 +40,7 @@ public final class EconomyStore {
 	private final Map<UUID, Long> balances = new HashMap<>();
 	private final Map<UUID, String> names = new HashMap<>();
 	private final List<Transaction> transactions = new ArrayList<>();
+	private long treasuryBalance;
 
 	private long lastMintTime;
 	private long mintedToday;
@@ -347,6 +348,39 @@ public final class EconomyStore {
 		return burned;
 	}
 
+	/* ---------- zecca / tesoro ---------- */
+
+	public long treasuryBalance() {
+		return treasuryBalance;
+	}
+
+	public long creditTreasury(long amount) {
+		if (amount < 0L) throw new IllegalArgumentException("amount < 0");
+		try {
+			treasuryBalance = Math.addExact(treasuryBalance, amount);
+		} catch (ArithmeticException e) {
+			treasuryBalance = Long.MAX_VALUE;
+		}
+		markDirty();
+		return treasuryBalance;
+	}
+
+	public long debitTreasury(long amount) {
+		if (amount < 0L) throw new IllegalArgumentException("amount < 0");
+		if (amount > treasuryBalance) {
+			throw new IllegalArgumentException("saldo della zecca insufficiente");
+		}
+		treasuryBalance -= amount;
+		markDirty();
+		return treasuryBalance;
+	}
+
+	public void setTreasuryBalance(long value) {
+		if (value < 0L) value = 0L;
+		treasuryBalance = value;
+		markDirty();
+	}
+
 	/* ---------- registro transazioni ---------- */
 
 	public void log(
@@ -465,6 +499,7 @@ public final class EconomyStore {
 			players.add(entry.getKey().toString(), player);
 		}
 		root.add("players", players);
+		root.addProperty("treasury", treasuryBalance);
 		return gson.toJson(root);
 	}
 
@@ -502,6 +537,11 @@ public final class EconomyStore {
 				if (player.has("name") && player.get("name").isJsonPrimitive()) {
 					names.put(id, player.get("name").getAsString());
 				}
+			}
+			if (root.has("treasury") && root.get("treasury").isJsonPrimitive()) {
+				long treasury = root.get("treasury").getAsLong();
+				if (treasury < 0L) treasury = 0L;
+				treasuryBalance = treasury;
 			}
 		} catch (Exception e) {
 			backupCorrupt(balancesPath);

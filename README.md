@@ -44,6 +44,9 @@ It does not need to be installed on clients: it adds persistent balances, paymen
 | `/setbalance <player> <amount>` | Sets a player's balance. Admin only. |
 | `/takebalance <player> <amount>` | Removes money from a player's balance. Admin only. |
 | `/transactions [player] [limit]` | Shows recent transactions. Admin only. |
+| `/treasury` | Shows the mint/treasury balance. |
+| `/settax <percent>` | Sets the transaction tax percentage. Admin only. |
+| `/treasurypay <player> <amount>` | Pays a player from the treasury. Admin only. |
 
 Amounts are integers (`long`), without decimals.
 
@@ -65,7 +68,7 @@ The file is created automatically at `config/moneta.json`:
   "regulationIntervalSeconds": 300,
   "regulationTolerancePercent": 10,
   "regulationRatePercent": 2,
-  "transactionTaxPercent": 1,
+  "transactionTaxPercent": 5,
   "maxBalance": 100000,
   "mintCooldownSeconds": 60,
   "mintDailyLimit": 100000
@@ -89,7 +92,7 @@ The file is created automatically at `config/moneta.json`:
 - `regulationIntervalSeconds`: time between automatic regulations.
 - `regulationTolerancePercent`: allowed deviation before the system intervenes.
 - `regulationRatePercent`: strength of automatic creation or burning.
-- `transactionTaxPercent`: percentage burned on every transfer.
+- `transactionTaxPercent`: percentage sent to the treasury on every transfer.
 - `maxBalance`: maximum balance per account. `0` disables the cap.
 - `mintCooldownSeconds`: cooldown for `/mint`.
 - `mintDailyLimit`: daily limit for `/mint`. `0` disables the limit.
@@ -101,11 +104,18 @@ Moneta includes a self-regulating monetary system:
 - It calculates a **target money supply** from `targetBalancePerPlayer` and the number of known accounts.
 - If the supply is **too low**, the mint creates money and distributes it to online players.
 - If the supply is **too high**, it burns a percentage of the excess from balances above the per-player target.
-- Every transfer pays a **transaction tax**, which is burned and removed from circulation.
+- Every transfer pays a **transaction tax**, which is stored in the treasury instead of being burned.
 - Balances cannot exceed `maxBalance`.
 - `/mint` is protected by a cooldown and a daily limit.
 
 This keeps the currency from losing value through uncontrolled inflation while still allowing the economy to grow with the player base.
+
+## Treasury
+
+Transaction taxes are not burned: they are stored in the **mint treasury**.  
+This balance can be used by administrators to pay players for services that benefit everyone, such as public infrastructure or guaranteed minimum services.
+
+Example: if a free food service is funded by the treasury, the food can be purchased from players who produce meat or crops, redistributing tax money back into the economy.
 
 ## Data
 

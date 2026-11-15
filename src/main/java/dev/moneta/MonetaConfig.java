@@ -29,7 +29,7 @@ public final class MonetaConfig {
 	public int regulationIntervalSeconds = 300;
 	public int regulationTolerancePercent = 10;
 	public int regulationRatePercent = 2;
-	public int transactionTaxPercent = 1;
+	public int transactionTaxPercent = 5;
 	public long maxBalance = 100000L;
 	public int mintCooldownSeconds = 60;
 	public long mintDailyLimit = 100000L;
@@ -60,6 +60,19 @@ public final class MonetaConfig {
 			log.error("Moneta: impossibile scrivere la config: {}", e.toString());
 		}
 		return config;
+	}
+
+	public static void save(MonetaConfig config, Path path, Logger log) {
+		Gson gson = new GsonBuilder().setPrettyPrinting().create();
+		config.validate();
+		try {
+			Files.createDirectories(path.getParent());
+			try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+				gson.toJson(config, writer);
+			}
+		} catch (Exception e) {
+			log.error("Moneta: impossibile salvare la config: {}", e.toString());
+		}
 	}
 
 	private void validate() {
