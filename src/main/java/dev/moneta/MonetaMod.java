@@ -1,31 +1,34 @@
 package dev.moneta;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
-import java.io.Reader;
-import java.io.Writer;
+import com.mojang.brigadier.arguments.LongArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
-import net.minecraft.commands.arguments.EntityArgument;
+import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.permissions.Permissions;
+import net.minecraft.server.players.NameAndId;
 import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,423 +36,731 @@ import org.slf4j.LoggerFactory;
 public class MonetaMod implements ModInitializer {
 
 	public static final Logger LOG = LoggerFactory.getLogger("moneta");
-	public static final String OBJECTIVE = "saldo";
 
-	private final Map<UUID, Long> balances = new HashMap<>();
-	private final Map<UUID, String> names = new HashMap<>();
-	private Path dataPath;
-	private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+	private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern(
+		"yyyy-MM-dd HH:mm:ss"
+	).withZone(ZoneId.systemDefault());
+	private static final int TRANSACTIONS_DEFAULT_LIMIT = 10;
+
+	private MinecraftServer server;
+	private MonetaConfig config;
+	private EconomyStore store;
+	private long lastAutosave;
 
 	@Override
 	public void onInitialize() {
 		ServerLifecycleEvents.SERVER_STARTED.register(this::start);
 		ServerLifecycleEvents.SERVER_STOPPING.register(this::stop);
-		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
-			UUID id = handler.player.getUUID();
-			names.put(id, handler.player.getGameProfile().name());
-			LOG.info(
-				"Moneta: {} joined, updating display",
+		ServerTickEvents.END_SERVER_TICK.register(this::tick);
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, joinedServer) -> {
+			if (store == null) return;
+			store.ensureAccount(
+				handler.player.getUUID(),
 				handler.player.getGameProfile().name()
 			);
-			// Delay: send after the client has finished its login sequence
-			server.execute(() -> showMoney(handler.player));
+			persistMaybe();
 		});
 
 		CommandRegistrationCallback.EVENT.register(
-			(dispatcher, registries, environment) -> {
-				dispatcher.register(
-					Commands.literal("balance").executes(ctx ->
-						showBalance(ctx.getSource())
-					)
-				);
-				dispatcher.register(
-					Commands.literal("bal").executes(ctx ->
-						showBalance(ctx.getSource())
-					)
-				);
-				dispatcher.register(
-					Commands.literal("money").executes(ctx ->
-						showBalance(ctx.getSource())
-					)
-				);
+			(dispatcher, registries, environment) -> registerCommands(dispatcher)
+		);
+	}
 
-				dispatcher.register(
-					Commands.literal("send").then(
-						Commands.argument(
-							"amount",
-							IntegerArgumentType.integer(1)
-						).then(
-							Commands.argument(
-								"player",
-								EntityArgument.player()
-							).executes(ctx ->
-								sendMoney(
-									ctx.getSource(),
-									IntegerArgumentType.getInteger(
-										ctx,
-										"amount"
-									),
-									EntityArgument.getPlayer(ctx, "player")
-								)
-							)
+	private void start(MinecraftServer startedServer) {
+		server = startedServer;
+		config = MonetaConfig.load(
+			startedServer.getFile("config").resolve("moneta.json"),
+			LOG
+		);
+
+		Path dataDirectory = startedServer
+			.getWorldPath(LevelResource.ROOT)
+			.resolve("moneta");
+		try {
+			Files.createDirectories(dataDirectory);
+		} catch (Exception e) {
+			LOG.error("Moneta: impossibile creare la cartella dati: {}", e.toString());
+		}
+
+		store = new EconomyStore(
+			dataDirectory.resolve("balances.json"),
+			dataDirectory.resolve("transactions.json"),
+			config,
+			LOG
+		);
+		lastAutosave = System.currentTimeMillis();
+		LOG.info(
+			"Moneta pronto. {} conti, totale in circolazione: {}",
+			store.accountCount(),
+			config.money(store.total())
+		);
+	}
+
+	private void stop(MinecraftServer stoppingServer) {
+		if (store != null) {
+			store.shutdown();
+			store = null;
+		}
+		server = null;
+	}
+
+	private void tick(MinecraftServer tickingServer) {
+		if (store == null || config == null) return;
+		if (config.autosaveSeconds <= 0) return;
+		if (!store.isDirty()) return;
+		long now = System.currentTimeMillis();
+		if (now - lastAutosave < config.autosaveSeconds * 1000L) return;
+		store.saveAsync();
+		lastAutosave = now;
+	}
+
+	private void persistMaybe() {
+		if (store != null && config != null && config.autosaveSeconds == 0) {
+			store.saveAsync();
+		}
+	}
+
+	/* ---------- comandi ---------- */
+
+	private void registerCommands(CommandDispatcher<CommandSourceStack> dispatcher) {
+		dispatcher.register(
+			Commands.literal("balance")
+				.executes(context -> showBalance(context.getSource(), null))
+				.then(
+					playerArgument("player").executes(context ->
+						showBalance(
+							context.getSource(),
+							StringArgumentType.getString(context, "player")
 						)
 					)
-				);
+				)
+		);
 
-				dispatcher.register(
-					Commands.literal("mint")
-						.requires(src ->
-							src
-								.permissions()
-								.hasPermission(Permissions.COMMANDS_GAMEMASTER)
+		dispatcher.register(
+			Commands.literal("send").then(
+				playerArgument("player").then(
+					Commands.argument("amount", LongArgumentType.longArg(1L)).executes(
+						context ->
+							sendMoney(
+								context.getSource(),
+								StringArgumentType.getString(context, "player"),
+								LongArgumentType.getLong(context, "amount")
+							)
+					)
+				)
+			)
+		);
+
+		dispatcher.register(
+			Commands.literal("mint").then(
+				Commands.argument("amount", LongArgumentType.longArg(1L)).executes(
+					context ->
+						mint(
+							context.getSource(),
+							LongArgumentType.getLong(context, "amount")
+						)
+				)
+			)
+		);
+
+		dispatcher.register(
+			Commands.literal("economy")
+				.executes(context -> economy(context.getSource(), -1))
+				.then(
+					Commands.argument("limit", IntegerArgumentType.integer(1)).executes(
+						context ->
+							economy(
+								context.getSource(),
+								IntegerArgumentType.getInteger(context, "limit")
+							)
+					)
+				)
+		);
+
+		dispatcher.register(
+			Commands.literal("setbalance")
+				.requires(this::isAdmin)
+				.then(
+					playerArgument("player").then(
+						Commands.argument("amount", LongArgumentType.longArg(0L)).executes(
+							context ->
+								setBalance(
+									context.getSource(),
+									StringArgumentType.getString(context, "player"),
+									LongArgumentType.getLong(context, "amount")
+								)
+						)
+					)
+				)
+		);
+
+		dispatcher.register(
+			Commands.literal("takebalance")
+				.requires(this::isAdmin)
+				.then(
+					playerArgument("player").then(
+						Commands.argument("amount", LongArgumentType.longArg(1L)).executes(
+							context ->
+								takeBalance(
+									context.getSource(),
+									StringArgumentType.getString(context, "player"),
+									LongArgumentType.getLong(context, "amount")
+								)
+						)
+					)
+				)
+		);
+
+		dispatcher.register(
+			Commands.literal("transactions")
+				.requires(this::isAdmin)
+				.executes(context -> showTransactions(context.getSource(), null, -1))
+				.then(
+					playerArgument("player")
+						.executes(context ->
+							showTransactions(
+								context.getSource(),
+								StringArgumentType.getString(context, "player"),
+								-1
+							)
 						)
 						.then(
 							Commands.argument(
-								"amount",
+								"limit",
 								IntegerArgumentType.integer(1)
-							).executes(ctx ->
-								mint(
-									ctx.getSource(),
-									IntegerArgumentType.getInteger(
-										ctx,
-										"amount"
-									)
+							).executes(context ->
+								showTransactions(
+									context.getSource(),
+									StringArgumentType.getString(context, "player"),
+									IntegerArgumentType.getInteger(context, "limit")
 								)
 							)
 						)
-				);
-
-				dispatcher.register(
-					Commands.literal("economy").executes(ctx ->
-						economy(ctx.getSource())
-					)
-				);
-				dispatcher.register(
-					Commands.literal("moneyinfo").executes(ctx ->
-						economy(ctx.getSource())
-					)
-				);
-				dispatcher.register(
-					Commands.literal("balancetop").executes(ctx ->
-						economy(ctx.getSource())
-					)
-				);
-			}
+				)
 		);
 	}
 
-	private void start(MinecraftServer server) {
-		dataPath = server
-			.getWorldPath(LevelResource.ROOT)
-			.resolve("moneta")
-			.resolve("balances.json");
-		try {
-			Files.createDirectories(dataPath.getParent());
-		} catch (Exception e) {
-			LOG.error("Moneta: could not create data dir: {}", e.toString());
-		}
-		load();
-		LOG.info("Moneta ready. Total in circulation: {}", totalMoney());
+	private RequiredArgumentBuilder<CommandSourceStack, String> playerArgument(
+		String name
+	) {
+		return Commands.argument(name, StringArgumentType.word()).suggests(
+			(context, builder) ->
+				SharedSuggestionProvider.suggest(knownNames(), builder)
+		);
 	}
 
-	private void stop(MinecraftServer server) {
-		save();
-	}
-
-	/* ---------- data ---------- */
-
-	private long getBalance(UUID id) {
-		return balances.getOrDefault(id, 0L);
-	}
-
-	private void setBalance(UUID id, long value, String name) {
-		balances.put(id, Math.max(0L, value));
-		if (name != null) names.put(id, name);
-	}
-
-	private void setBalance(UUID id, long value) {
-		setBalance(id, value, null);
-	}
-
-	private long totalMoney() {
-		long t = 0;
-		for (long v : balances.values()) t += v;
-		return t;
-	}
-
-	private void load() {
-		if (dataPath == null || !Files.exists(dataPath)) return;
-		try (Reader r = Files.newBufferedReader(dataPath)) {
-			JsonObject root = JsonParser.parseReader(r).getAsJsonObject();
-			if (!root.has("players")) return;
-			JsonObject players = root.getAsJsonObject("players");
-			for (String key : players.keySet()) {
-				UUID id;
-				try {
-					id = UUID.fromString(key);
-				} catch (IllegalArgumentException e) {
-					continue;
-				}
-				JsonObject po = players.getAsJsonObject(key);
-				long bal = po.has("balance")
-					? po.get("balance").getAsLong()
-					: 0L;
-				balances.put(id, bal);
-				if (po.has("name")) names.put(id, po.get("name").getAsString());
+	private List<String> knownNames() {
+		Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+		if (store != null) names.addAll(store.knownNames());
+		if (server != null) {
+			for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+				names.add(player.getGameProfile().name());
 			}
-		} catch (Exception e) {
-			LOG.error("Moneta: failed to load balances: {}", e.toString());
 		}
+		return new ArrayList<>(names);
 	}
 
-	private void save() {
-		if (dataPath == null) return;
-		try {
-			Files.createDirectories(dataPath.getParent());
-			JsonObject root = new JsonObject();
-			JsonObject players = new JsonObject();
-			for (UUID id : balances.keySet()) {
-				JsonObject po = new JsonObject();
-				po.addProperty("balance", balances.get(id));
-				String n = names.get(id);
-				if (n != null) po.addProperty("name", n);
-				players.add(id.toString(), po);
-			}
-			root.add("players", players);
-			try (Writer w = Files.newBufferedWriter(dataPath)) {
-				gson.toJson(root, w);
-			}
-		} catch (Exception e) {
-			LOG.error("Moneta: failed to save balances: {}", e.toString());
-		}
-	}
+	/* ---------- implementazione comandi ---------- */
 
-	/* ---------- scoreboard display (top-right) ---------- */
+	private int showBalance(CommandSourceStack source, String playerName) {
+		if (store == null) return 0;
 
-	private void showMoney(ServerPlayer p) {
-		LOG.info("showMoney called for {}", p.getGameProfile().name());
-		String objName = OBJECTIVE;
-		net.minecraft.world.scores.Scoreboard dummy =
-			new net.minecraft.world.scores.Scoreboard();
-		net.minecraft.world.scores.Objective obj =
-			new net.minecraft.world.scores.Objective(
-				dummy,
-				objName,
-				net.minecraft.world.scores.criteria.ObjectiveCriteria.DUMMY,
-				Component.literal(" "),
-				net.minecraft.world.scores.criteria.ObjectiveCriteria.RenderType.INTEGER,
-				false,
-				null
+		if (playerName == null) {
+			ServerPlayer player = source.getPlayer();
+			if (player == null) {
+				source.sendFailure(
+					Component.literal("Specifica un giocatore: /balance <player>.")
+				);
+				return 0;
+			}
+			store.ensureAccount(player.getUUID(), player.getGameProfile().name());
+			persistMaybe();
+			source.sendSuccess(
+				() ->
+					Component.literal(
+						"Il tuo saldo: " + config.money(store.balance(player.getUUID()))
+					),
+				false
 			);
-		// Remove any stale objective first, then re-add
-		p.connection.send(
-			new net.minecraft.network.protocol.game.ClientboundSetObjectivePacket(
-				obj,
-				net.minecraft.network.protocol.game.ClientboundSetObjectivePacket.METHOD_REMOVE
-			)
-		);
-		p.connection.send(
-			new net.minecraft.network.protocol.game.ClientboundSetObjectivePacket(
-				obj,
-				net.minecraft.network.protocol.game.ClientboundSetObjectivePacket.METHOD_ADD
-			)
-		);
-		p.connection.send(
-			new net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket(
-				net.minecraft.world.scores.DisplaySlot.SIDEBAR, obj
-			)
-		);
-		long bal = getBalance(p.getUUID());
-		int score = (int) Math.min(bal, Integer.MAX_VALUE);
-		p.connection.send(
-			new net.minecraft.network.protocol.game.ClientboundSetScorePacket(
-				" ",
-				objName,
-				score,
-				java.util.Optional.empty(),
-				java.util.Optional.of(
-					new net.minecraft.network.chat.numbers.FixedFormat(
-						net.minecraft.network.chat.Component.literal("$" + bal)
-							.withStyle(net.minecraft.ChatFormatting.GREEN)
-					)
-				)
-			)
-		);
-		names.put(p.getUUID(), p.getGameProfile().name());
-	}
+			return 1;
+		}
 
-	/* ---------- commands ---------- */
-
-	private int showBalance(CommandSourceStack src) {
-		ServerPlayer p = src.getPlayer();
-		if (p == null) {
-			src.sendFailure(
-				Component.literal(
-					"Solo i giocatori possono usare questo comando."
-				)
+		Optional<NameAndId> resolved = resolve(playerName);
+		if (resolved.isEmpty()) {
+			source.sendFailure(
+				Component.literal("Giocatore non trovato: " + playerName + ".")
 			);
 			return 0;
 		}
-		names.put(p.getUUID(), p.getGameProfile().name());
-		long bal = getBalance(p.getUUID());
-		src.sendSuccess(() -> Component.literal("Il tuo saldo: " + bal), false);
+		NameAndId target = resolved.get();
+		String targetName = nameOf(target);
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Saldo di " +
+						targetName +
+						": " +
+						config.money(store.balance(target.id()))
+				),
+			false
+		);
 		return 1;
 	}
 
 	private int sendMoney(
-		CommandSourceStack src,
-		int amount,
-		ServerPlayer target
+		CommandSourceStack source,
+		String targetName,
+		long amount
 	) {
-		ServerPlayer sender = src.getPlayer();
+		if (store == null) return 0;
+		ServerPlayer sender = source.getPlayer();
 		if (sender == null) {
-			src.sendFailure(
+			source.sendFailure(
 				Component.literal("Solo i giocatori possono inviare denaro.")
 			);
 			return 0;
 		}
-		if (amount <= 0) {
-			src.sendFailure(
+		if (amount <= 0L) {
+			source.sendFailure(
 				Component.literal("L'importo deve essere maggiore di zero.")
 			);
 			return 0;
 		}
-		if (target == null || !target.isAlive()) {
-			src.sendFailure(Component.literal("Giocatore non trovato."));
+
+		Optional<NameAndId> resolved = resolve(targetName);
+		if (resolved.isEmpty()) {
+			source.sendFailure(
+				Component.literal("Giocatore non trovato: " + targetName + ".")
+			);
 			return 0;
 		}
-		if (sender.getUUID().equals(target.getUUID())) {
-			src.sendFailure(
+		NameAndId target = resolved.get();
+		if (sender.getUUID().equals(target.id())) {
+			source.sendFailure(
 				Component.literal("Non puoi inviare denaro a te stesso.")
 			);
 			return 0;
 		}
-		long senderBal = getBalance(sender.getUUID());
-		if (senderBal < amount) {
-			src.sendFailure(
-				Component.literal("Fondi insufficienti. Saldo: " + senderBal)
-			);
-			return 0;
-		}
-		names.put(sender.getUUID(), sender.getGameProfile().name());
-		names.put(target.getUUID(), target.getGameProfile().name());
-		setBalance(sender.getUUID(), senderBal - amount);
-		setBalance(target.getUUID(), getBalance(target.getUUID()) + amount);
-		save();
-		showMoney(sender);
-		showMoney(target);
-		src.sendSuccess(
-			() ->
-				Component.literal(
-					"Inviati " +
-						amount +
-						" a " +
-						target.getGameProfile().name() +
-						". Nuovo saldo: " +
-						getBalance(sender.getUUID())
-				),
-			false
-		);
-		target.sendSystemMessage(
-			Component.literal(
-				sender.getGameProfile().name() +
-					" ti ha inviato " +
-					amount +
-					". Nuovo saldo: " +
-					getBalance(target.getUUID())
-			)
-		);
-		return 1;
-	}
 
-	private int mint(CommandSourceStack src, int amount) {
-		MinecraftServer server = src.getServer();
-		List<ServerPlayer> players = new ArrayList<>(
-			server.getPlayerList().getPlayers()
-		);
-		if (players.isEmpty()) {
-			src.sendFailure(
+		String senderName = sender.getGameProfile().name();
+		String resolvedTargetName = nameOf(target);
+		store.setName(sender.getUUID(), senderName);
+		store.ensureAccount(target.id(), resolvedTargetName);
+
+		long senderBalance = store.balance(sender.getUUID());
+		if (senderBalance < amount) {
+			source.sendFailure(
 				Component.literal(
-					"Nessun giocatore online per distribuire il denaro."
+					"Fondi insufficienti. Saldo: " + config.money(senderBalance)
 				)
 			);
 			return 0;
 		}
-		if (amount <= 0) {
-			src.sendFailure(
+		if (!store.canCredit(target.id(), amount)) {
+			source.sendFailure(
+				Component.literal("Il destinatario ha raggiunto il saldo massimo.")
+			);
+			return 0;
+		}
+
+		long newSenderBalance = store.debit(sender.getUUID(), amount);
+		long newTargetBalance = store.credit(target.id(), amount);
+		store.log(
+			"SEND",
+			sender.getUUID(),
+			senderName,
+			target.id(),
+			resolvedTargetName,
+			amount,
+			newTargetBalance
+		);
+		persistMaybe();
+
+		ServerPlayer onlineTarget = server.getPlayerList().getPlayer(target.id());
+		String offlineSuffix = onlineTarget == null ? " (offline)" : "";
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Inviati " +
+						config.money(amount) +
+						" a " +
+						resolvedTargetName +
+						offlineSuffix +
+						". Nuovo saldo: " +
+						config.money(newSenderBalance)
+				),
+			false
+		);
+		if (onlineTarget != null) {
+			onlineTarget.sendSystemMessage(
+				Component.literal(
+					senderName +
+						" ti ha inviato " +
+						config.money(amount) +
+						". Nuovo saldo: " +
+						config.money(newTargetBalance)
+				)
+			);
+		}
+		return 1;
+	}
+
+	private int mint(CommandSourceStack source, long amount) {
+		if (store == null || server == null) return 0;
+		List<ServerPlayer> players = new ArrayList<>(
+			server.getPlayerList().getPlayers()
+		);
+		if (players.isEmpty()) {
+			source.sendFailure(
+				Component.literal("Nessun giocatore online per distribuire il denaro.")
+			);
+			return 0;
+		}
+		if (amount <= 0L) {
+			source.sendFailure(
 				Component.literal("L'importo deve essere maggiore di zero.")
 			);
 			return 0;
 		}
+
 		long share = amount / players.size();
 		long remainder = amount % players.size();
-		for (int i = 0; i < players.size(); i++) {
-			ServerPlayer p = players.get(i);
-			long add = share + (i < remainder ? 1 : 0);
-			names.put(p.getUUID(), p.getGameProfile().name());
-			setBalance(p.getUUID(), getBalance(p.getUUID()) + add);
+		for (ServerPlayer player : players) {
+			store.ensureAccount(player.getUUID(), player.getGameProfile().name());
 		}
-		save();
-		for (ServerPlayer p : players) showMoney(p);
-		src.sendSuccess(
+		for (int i = 0; i < players.size(); i++) {
+			ServerPlayer player = players.get(i);
+			long add = share + (i < remainder ? 1L : 0L);
+			if (!store.canCredit(player.getUUID(), add)) {
+				source.sendFailure(
+					Component.literal(
+						"Il saldo di " +
+							player.getGameProfile().name() +
+							" ha raggiunto il massimo."
+					)
+				);
+				return 0;
+			}
+		}
+
+		long distributed = 0L;
+		for (int i = 0; i < players.size(); i++) {
+			ServerPlayer player = players.get(i);
+			long add = share + (i < remainder ? 1L : 0L);
+			if (add <= 0L) continue;
+			long newBalance = store.credit(player.getUUID(), add);
+			distributed += add;
+			store.log(
+				"MINT",
+				null,
+				"Zecca",
+				player.getUUID(),
+				player.getGameProfile().name(),
+				add,
+				newBalance
+			);
+		}
+		persistMaybe();
+
+		long totalDistributed = distributed;
+		source.sendSuccess(
 			() ->
 				Component.literal(
 					"Zecca: messi in circolazione " +
-						amount +
+						config.money(totalDistributed) +
 						" (totale ora: " +
-						totalMoney() +
+						config.money(store.total()) +
 						"), distribuiti a " +
 						players.size() +
 						" giocatori."
 				),
 			true
 		);
-		for (ServerPlayer p : players) {
-			p.sendSystemMessage(
+		for (int i = 0; i < players.size(); i++) {
+			long add = share + (i < remainder ? 1L : 0L);
+			if (add <= 0L) continue;
+			ServerPlayer player = players.get(i);
+			long newBalance = store.balance(player.getUUID());
+			player.sendSystemMessage(
 				Component.literal(
-					"La zecca ha distribuito denaro. Il tuo saldo: " +
-						getBalance(p.getUUID())
+					"La zecca ti ha accreditato " +
+						config.money(add) +
+						". Nuovo saldo: " +
+						config.money(newBalance)
 				)
 			);
 		}
 		return 1;
 	}
 
-	private int economy(CommandSourceStack src) {
-		MinecraftServer server = src.getServer();
-		long total = totalMoney();
-		List<Map.Entry<UUID, Long>> entries = new ArrayList<>(
-			balances.entrySet()
-		);
-		entries.sort(
-			Comparator.comparingLong((Map.Entry<UUID, Long> e) ->
-				e.getValue()
-			).reversed()
-		);
-		src.sendSuccess(
-			() -> Component.literal("Totale in circolazione: " + total),
+	private int economy(CommandSourceStack source, int requestedLimit) {
+		if (store == null) return 0;
+		int limit = requestedLimit > 0
+			? Math.min(requestedLimit, config.economyMaxLimit)
+			: config.economyTopLimit;
+		long total = store.total();
+		int accounts = store.accountCount();
+
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Totale in circolazione: " +
+						config.money(total) +
+						" (" +
+						accounts +
+						" conti)"
+				),
 			false
 		);
-		if (total <= 0) {
-			src.sendSuccess(
+		if (total <= 0L) {
+			source.sendSuccess(
 				() -> Component.literal("Nessun denaro in circolazione."),
 				false
 			);
 			return 1;
 		}
-		for (Map.Entry<UUID, Long> e : entries) {
-			if (e.getValue() <= 0) continue;
-			String name = names.getOrDefault(e.getKey(), e.getKey().toString());
-			double pct = (e.getValue() * 100.0) / total;
+
+		List<java.util.Map.Entry<UUID, Long>> top = store.top(limit);
+		int rank = 1;
+		for (java.util.Map.Entry<UUID, Long> entry : top) {
+			String name = store.name(entry.getKey());
+			if (name == null) name = entry.getKey().toString();
+			double percentage = (entry.getValue() * 100.0) / total;
+			String displayedName = name;
 			String line =
-				name +
+				rank +
+				". " +
+				displayedName +
 				": " +
-				e.getValue() +
+				config.money(entry.getValue()) +
 				" (" +
-				String.format("%.2f", pct) +
+				String.format(Locale.ROOT, "%.2f", percentage) +
 				"%)";
-			src.sendSuccess(() -> Component.literal(line), false);
+			source.sendSuccess(() -> Component.literal(line), false);
+			rank++;
 		}
 		return 1;
+	}
+
+	private int setBalance(
+		CommandSourceStack source,
+		String targetName,
+		long amount
+	) {
+		if (store == null) return 0;
+		Optional<NameAndId> resolved = resolve(targetName);
+		if (resolved.isEmpty()) {
+			source.sendFailure(
+				Component.literal("Giocatore non trovato: " + targetName + ".")
+			);
+			return 0;
+		}
+		NameAndId target = resolved.get();
+		String resolvedTargetName = nameOf(target);
+		store.ensureAccount(target.id(), resolvedTargetName);
+		long newBalance = store.setBalance(target.id(), amount);
+		store.log(
+			"SET",
+			source.getPlayer() == null ? null : source.getPlayer().getUUID(),
+			source.getTextName(),
+			target.id(),
+			resolvedTargetName,
+			amount,
+			newBalance
+		);
+		persistMaybe();
+
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Saldo di " +
+						resolvedTargetName +
+						" impostato a " +
+						config.money(newBalance) +
+						"."
+				),
+			true
+		);
+		ServerPlayer onlineTarget = server.getPlayerList().getPlayer(target.id());
+		if (onlineTarget != null) {
+			onlineTarget.sendSystemMessage(
+				Component.literal(
+					"Il tuo saldo è stato impostato a " +
+						config.money(newBalance) +
+						"."
+				)
+			);
+		}
+		return 1;
+	}
+
+	private int takeBalance(
+		CommandSourceStack source,
+		String targetName,
+		long amount
+	) {
+		if (store == null) return 0;
+		Optional<NameAndId> resolved = resolve(targetName);
+		if (resolved.isEmpty()) {
+			source.sendFailure(
+				Component.literal("Giocatore non trovato: " + targetName + ".")
+			);
+			return 0;
+		}
+		NameAndId target = resolved.get();
+		String resolvedTargetName = nameOf(target);
+		store.ensureAccount(target.id(), resolvedTargetName);
+		long currentBalance = store.balance(target.id());
+		if (currentBalance < amount) {
+			source.sendFailure(
+				Component.literal(
+					"Fondi insufficienti. Saldo di " +
+						resolvedTargetName +
+						": " +
+						config.money(currentBalance)
+				)
+			);
+			return 0;
+		}
+
+		long newBalance = store.debit(target.id(), amount);
+		store.log(
+			"TAKE",
+			source.getPlayer() == null ? null : source.getPlayer().getUUID(),
+			source.getTextName(),
+			target.id(),
+			resolvedTargetName,
+			amount,
+			newBalance
+		);
+		persistMaybe();
+
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Rimossi " +
+						config.money(amount) +
+						" a " +
+						resolvedTargetName +
+						". Nuovo saldo: " +
+						config.money(newBalance)
+				),
+			true
+		);
+		ServerPlayer onlineTarget = server.getPlayerList().getPlayer(target.id());
+		if (onlineTarget != null) {
+			onlineTarget.sendSystemMessage(
+				Component.literal(
+					"Sono stati rimossi " +
+						config.money(amount) +
+						" dal tuo saldo. Nuovo saldo: " +
+						config.money(newBalance)
+				)
+			);
+		}
+		return 1;
+	}
+
+	private int showTransactions(
+		CommandSourceStack source,
+		String playerName,
+		int requestedLimit
+	) {
+		if (store == null) return 0;
+		int limit = requestedLimit > 0
+			? Math.min(requestedLimit, config.transactionLogLimit)
+			: Math.min(TRANSACTIONS_DEFAULT_LIMIT, config.transactionLogLimit);
+
+		UUID filterId = null;
+		String filterName = null;
+		if (playerName != null) {
+			Optional<NameAndId> resolved = resolve(playerName);
+			if (resolved.isPresent()) {
+				filterId = resolved.get().id();
+				filterName = nameOf(resolved.get());
+			} else {
+				filterName = playerName;
+			}
+		}
+
+		List<EconomyStore.Transaction> selected = new ArrayList<>();
+		for (EconomyStore.Transaction transaction : store.transactions()) {
+			if (
+				playerName != null && !transaction.involves(filterId, filterName)
+			) {
+				continue;
+			}
+			selected.add(transaction);
+			if (selected.size() >= limit) break;
+		}
+
+		String scope = playerName == null ? "" : " di " + playerName;
+		source.sendSuccess(
+			() ->
+				Component.literal(
+					"Ultime " + selected.size() + " transazioni" + scope + ":"
+				),
+			false
+		);
+		if (selected.isEmpty()) {
+			source.sendSuccess(
+				() -> Component.literal("Nessuna transazione trovata."),
+				false
+			);
+			return 1;
+		}
+		for (EconomyStore.Transaction transaction : selected) {
+			String line = describe(transaction);
+			source.sendSuccess(() -> Component.literal(line), false);
+		}
+		return 1;
+	}
+
+	private String describe(EconomyStore.Transaction transaction) {
+		String when = TIME_FORMAT.format(Instant.ofEpochMilli(transaction.time()));
+		String actor = transaction.actorName() != null
+			? transaction.actorName()
+			: transaction.actor() != null ? transaction.actor() : "server";
+		String target = transaction.targetName() != null
+			? transaction.targetName()
+			: transaction.target() != null ? transaction.target() : "?";
+		return switch (transaction.type()) {
+			case "SEND" -> when + " SEND " + actor + " -> " + target + ": " +
+				config.money(transaction.amount()) + " (saldo: " +
+				config.money(transaction.balanceAfter()) + ")";
+			case "MINT" -> when + " MINT -> " + target + ": " +
+				config.money(transaction.amount()) + " (saldo: " +
+				config.money(transaction.balanceAfter()) + ")";
+			case "SET" -> when + " SET " + actor + " -> " + target + ": " +
+				config.money(transaction.amount()) + " (saldo: " +
+				config.money(transaction.balanceAfter()) + ")";
+			case "TAKE" -> when + " TAKE " + actor + " -> " + target + ": " +
+				config.money(transaction.amount()) + " (saldo: " +
+				config.money(transaction.balanceAfter()) + ")";
+			default -> when + " " + transaction.type() + " " + actor + " -> " +
+				target;
+		};
+	}
+
+	/* ---------- utilità ---------- */
+
+	private boolean isAdmin(CommandSourceStack source) {
+		return config != null && config.isAdmin(source);
+	}
+
+	private Optional<NameAndId> resolve(String name) {
+		if (server == null || name == null || name.isBlank()) {
+			return Optional.empty();
+		}
+		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+			if (player.getGameProfile().name().equalsIgnoreCase(name)) {
+				return Optional.of(new NameAndId(player.getGameProfile()));
+			}
+		}
+		return server.services().nameToIdCache().get(name);
+	}
+
+	private static String nameOf(NameAndId player) {
+		return player.name() == null ? player.id().toString() : player.name();
 	}
 }
