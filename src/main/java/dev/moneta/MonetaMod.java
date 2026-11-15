@@ -106,12 +106,22 @@ public class MonetaMod implements ModInitializer {
 
 	private void tick(MinecraftServer tickingServer) {
 		if (store == null || config == null) return;
-		if (config.autosaveSeconds <= 0) return;
-		if (!store.isDirty()) return;
 		long now = System.currentTimeMillis();
-		if (now - lastAutosave < config.autosaveSeconds * 1000L) return;
-		store.saveAsync();
-		lastAutosave = now;
+
+		if (config.autosaveSeconds > 0 && store.isDirty()) {
+			if (now - lastAutosave >= config.autosaveSeconds * 1000L) {
+				store.saveAsync();
+				lastAutosave = now;
+			}
+		}
+
+		if (config.regulationEnabled && store.isRegulationDue(config, now)) {
+			String summary = store.regulate(server, config);
+			if (summary != null) {
+				LOG.info("Moneta: {}", summary);
+				persistMaybe();
+			}
+		}
 	}
 
 	private void persistMaybe() {
@@ -347,8 +357,14 @@ public class MonetaMod implements ModInitializer {
 		store.setName(sender.getUUID(), senderName);
 		store.ensureAccount(target.id(), resolvedTargetName);
 
+		long fee = config.transactionTaxPercent > 0
+			? amount * config.transactionTaxPercent / 100L
+			: 0L;
+		if (fee <= 0L && config.transactionTaxPercent > 0) fee = 0L;
+		long totalCost = amount + fee;
+
 		long senderBalance = store.balance(sender.getUUID());
-		if (senderBalance < amount) {
+		if (senderBalance < totalCost) {
 			source.sendFailure(
 				Component.literal(
 					"Fondi insufficienti. Saldo: " + config.money(senderBalance)
@@ -363,7 +379,7 @@ public class MonetaMod implements ModInitializer {
 			return 0;
 		}
 
-		long newSenderBalance = store.debit(sender.getUUID(), amount);
+		long newSenderBalance = store.debit(sender.getUUID(), totalCost);
 		long newTargetBalance = store.credit(target.id(), amount);
 		store.log(
 			"SEND",
@@ -372,7 +388,8 @@ public class MonetaMod implements ModInitializer {
 			target.id(),
 			resolvedTargetName,
 			amount,
-			newTargetBalance
+			newTargetBalance,
+			fee
 		);
 		persistMaybe();
 
@@ -422,6 +439,15 @@ public class MonetaMod implements ModInitializer {
 			);
 			return 0;
 		}
+		long now = System.currentTimeMillis();
+		if (!store.canMint(amount, now)) {
+			source.sendFailure(
+				Component.literal(
+					"Zecca in raffreddamento o limite giornaliero raggiunto."
+				)
+			);
+			return 0;
+		}
 
 		long share = amount / players.size();
 		long remainder = amount % players.size();
@@ -457,9 +483,11 @@ public class MonetaMod implements ModInitializer {
 				player.getUUID(),
 				player.getGameProfile().name(),
 				add,
-				newBalance
+				newBalance,
+				0L
 			);
 		}
+		store.recordMint(amount, now);
 		persistMaybe();
 
 		long totalDistributed = distributed;
@@ -566,7 +594,8 @@ public class MonetaMod implements ModInitializer {
 			target.id(),
 			resolvedTargetName,
 			amount,
-			newBalance
+			newBalance,
+			0L
 		);
 		persistMaybe();
 
@@ -631,7 +660,8 @@ public class MonetaMod implements ModInitializer {
 			target.id(),
 			resolvedTargetName,
 			amount,
-			newBalance
+			newBalance,
+			0L
 		);
 		persistMaybe();
 
@@ -726,8 +756,9 @@ public class MonetaMod implements ModInitializer {
 			: transaction.target() != null ? transaction.target() : "?";
 		return switch (transaction.type()) {
 			case "SEND" -> when + " SEND " + actor + " -> " + target + ": " +
-				config.money(transaction.amount()) + " (saldo: " +
-				config.money(transaction.balanceAfter()) + ")";
+				config.money(transaction.amount()) +
+				(transaction.fee() > 0L ? " (tassa: " + config.money(transaction.fee()) + ")" : "") +
+				" (saldo: " + config.money(transaction.balanceAfter()) + ")";
 			case "MINT" -> when + " MINT -> " + target + ": " +
 				config.money(transaction.amount()) + " (saldo: " +
 				config.money(transaction.balanceAfter()) + ")";
@@ -737,8 +768,11 @@ public class MonetaMod implements ModInitializer {
 			case "TAKE" -> when + " TAKE " + actor + " -> " + target + ": " +
 				config.money(transaction.amount()) + " (saldo: " +
 				config.money(transaction.balanceAfter()) + ")";
+			case "REGULATE" -> when + " REGULATE -> Economia: " +
+				config.money(transaction.amount()) + " (totale: " +
+				config.money(transaction.balanceAfter()) + ")";
 			default -> when + " " + transaction.type() + " " + actor + " -> " +
-				target;
+				target + ": " + config.money(transaction.amount());
 		};
 	}
 

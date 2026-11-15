@@ -23,6 +23,17 @@ public final class MonetaConfig {
 	public int transactionLogLimit = 1000;
 	public int autosaveSeconds = 30;
 
+	/* Politica monetaria */
+	public boolean regulationEnabled = true;
+	public long targetBalancePerPlayer = 1000L;
+	public int regulationIntervalSeconds = 300;
+	public int regulationTolerancePercent = 10;
+	public int regulationRatePercent = 2;
+	public int transactionTaxPercent = 1;
+	public long maxBalance = 100000L;
+	public int mintCooldownSeconds = 60;
+	public long mintDailyLimit = 100000L;
+
 	private transient Permission adminPermissionValue =
 		Permissions.COMMANDS_GAMEMASTER;
 
@@ -60,6 +71,18 @@ public final class MonetaConfig {
 		if (transactionLogLimit < 1) transactionLogLimit = 1;
 		if (transactionLogLimit > 100_000) transactionLogLimit = 100_000;
 		if (autosaveSeconds < 0) autosaveSeconds = 0;
+
+		if (targetBalancePerPlayer < 0L) targetBalancePerPlayer = 0L;
+		if (regulationIntervalSeconds < 30) regulationIntervalSeconds = 30;
+		if (regulationTolerancePercent < 0) regulationTolerancePercent = 0;
+		if (regulationTolerancePercent > 100) regulationTolerancePercent = 100;
+		if (regulationRatePercent < 0) regulationRatePercent = 0;
+		if (regulationRatePercent > 100) regulationRatePercent = 100;
+		if (transactionTaxPercent < 0) transactionTaxPercent = 0;
+		if (transactionTaxPercent > 100) transactionTaxPercent = 100;
+		if (maxBalance < 0L) maxBalance = 0L;
+		if (mintCooldownSeconds < 0) mintCooldownSeconds = 0;
+		if (mintDailyLimit < 0L) mintDailyLimit = 0L;
 
 		String permission = adminPermission == null
 			? ""

@@ -23,6 +23,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
@@ -38,6 +40,11 @@ public final class EconomyStore {
 	private final Map<UUID, Long> balances = new HashMap<>();
 	private final Map<UUID, String> names = new HashMap<>();
 	private final List<Transaction> transactions = new ArrayList<>();
+
+	private long lastMintTime;
+	private long mintedToday;
+	private long mintDay;
+	private long lastRegulationTime;
 
 	private final ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
 		Thread thread = new Thread(r, "moneta-save");
@@ -87,7 +94,11 @@ public final class EconomyStore {
 	public void ensureAccount(UUID id, String name) {
 		boolean changed = false;
 		if (!balances.containsKey(id)) {
-			balances.put(id, config.startingBalance);
+			long startingBalance = config.startingBalance;
+			if (config.maxBalance > 0L && startingBalance > config.maxBalance) {
+				startingBalance = config.maxBalance;
+			}
+			balances.put(id, startingBalance);
 			changed = true;
 		}
 		if (name != null && !name.equals(names.get(id))) {
@@ -107,12 +118,25 @@ public final class EconomyStore {
 	public boolean canCredit(UUID id, long amount) {
 		if (amount < 0L) return false;
 		long current = balance(id);
-		return Long.MAX_VALUE - current >= amount;
+		if (Long.MAX_VALUE - current < amount) return false;
+		if (config.maxBalance > 0L && current + amount > config.maxBalance) {
+			return false;
+		}
+		return true;
 	}
 
 	public long credit(UUID id, long amount) {
 		if (amount < 0L) throw new IllegalArgumentException("amount < 0");
-		long value = Math.addExact(balance(id), amount);
+		long current = balance(id);
+		long value;
+		try {
+			value = Math.addExact(current, amount);
+		} catch (ArithmeticException e) {
+			value = Long.MAX_VALUE;
+		}
+		if (config.maxBalance > 0L && value > config.maxBalance) {
+			value = config.maxBalance;
+		}
 		balances.put(id, value);
 		markDirty();
 		return value;
@@ -132,6 +156,9 @@ public final class EconomyStore {
 
 	public long setBalance(UUID id, long value) {
 		if (value < 0L) throw new IllegalArgumentException("value < 0");
+		if (config.maxBalance > 0L && value > config.maxBalance) {
+			value = config.maxBalance;
+		}
 		balances.put(id, value);
 		markDirty();
 		return value;
@@ -161,6 +188,165 @@ public final class EconomyStore {
 		return entries;
 	}
 
+	/* ---------- zecca e limiti ---------- */
+
+	public boolean canMint(long amount, long now) {
+		if (amount <= 0L) return false;
+		if (config.mintCooldownSeconds > 0
+			&& now - lastMintTime < config.mintCooldownSeconds * 1000L) {
+			return false;
+		}
+		if (config.mintDailyLimit > 0L) {
+			long day = now / 86_400_000L;
+			if (day != mintDay) {
+				mintDay = day;
+				mintedToday = 0L;
+			}
+			if (mintedToday + amount > config.mintDailyLimit) return false;
+		}
+		return true;
+	}
+
+	public void recordMint(long amount, long now) {
+		lastMintTime = now;
+		if (config.mintDailyLimit > 0L) {
+			long day = now / 86_400_000L;
+			if (day != mintDay) {
+				mintDay = day;
+				mintedToday = 0L;
+			}
+			mintedToday += amount;
+		}
+	}
+
+	/* ---------- politica monetaria ---------- */
+
+	public boolean isRegulationDue(MonetaConfig config, long now) {
+		if (!config.regulationEnabled) return false;
+		if (lastRegulationTime == 0L) {
+			lastRegulationTime = now;
+			return false;
+		}
+		return now - lastRegulationTime >= config.regulationIntervalSeconds * 1000L;
+	}
+
+	public String regulate(MinecraftServer server, MonetaConfig config) {
+		if (!config.regulationEnabled) return null;
+		lastRegulationTime = System.currentTimeMillis();
+
+		long supply = total();
+		long accounts = Math.max(1L, accountCount());
+		long target = config.targetBalancePerPlayer * accounts;
+		long tolerance = target * config.regulationTolerancePercent / 100L;
+
+		if (supply < target - tolerance) {
+			long deficit = target - supply;
+			List<ServerPlayer> players = new ArrayList<>(
+				server.getPlayerList().getPlayers()
+			);
+			if (!players.isEmpty()) {
+				long minted = distributeRegulation(players, deficit, config);
+				if (minted > 0L) {
+					log(
+						"REGULATE",
+						null,
+						"Zecca",
+						null,
+						"Economia",
+						minted,
+						supply + minted,
+						0L
+					);
+					return "Regolazione: creati " + config.money(minted) + " (deficit).";
+				}
+			}
+		}
+
+		if (supply > target + tolerance) {
+			long burned = burnExcess(config, supply - target, config.regulationRatePercent);
+			if (burned > 0L) {
+				log(
+					"REGULATE",
+					null,
+					"Zecca",
+					null,
+					"Economia",
+					burned,
+					supply - burned,
+					0L
+				);
+				return "Regolazione: bruciati " + config.money(burned) + " (eccesso).";
+			}
+		}
+		return null;
+	}
+
+	private long distributeRegulation(
+		List<ServerPlayer> players,
+		long amount,
+		MonetaConfig config
+	) {
+		long share = amount / players.size();
+		long remainder = amount % players.size();
+		for (ServerPlayer player : players) {
+			ensureAccount(player.getUUID(), player.getGameProfile().name());
+		}
+		long minted = 0L;
+		for (int i = 0; i < players.size(); i++) {
+			ServerPlayer player = players.get(i);
+			long add = share + (i < remainder ? 1L : 0L);
+			if (add <= 0L) continue;
+			long current = balance(player.getUUID());
+			long room = config.maxBalance > 0L
+				? Math.max(0L, config.maxBalance - current)
+				: add;
+			long actual = Math.min(add, room);
+			if (actual <= 0L) continue;
+			credit(player.getUUID(), actual);
+			minted += actual;
+		}
+		return minted;
+	}
+
+	private long burnExcess(
+		MonetaConfig config,
+		long excess,
+		int ratePercent
+	) {
+		if (ratePercent <= 0) return 0L;
+		long toBurn = excess * ratePercent / 100L;
+		if (toBurn < 1L) toBurn = 1L;
+
+		List<Map.Entry<UUID, Long>> entries = new ArrayList<>();
+		for (Map.Entry<UUID, Long> entry : balances.entrySet()) {
+			if (entry.getValue() > 0L) entries.add(entry);
+		}
+		entries.sort(
+			Comparator.comparingLong((Map.Entry<UUID, Long> entry) ->
+				entry.getValue()
+			).reversed()
+		);
+
+		long burned = 0L;
+		for (Map.Entry<UUID, Long> entry : entries) {
+			if (burned >= toBurn) break;
+			UUID id = entry.getKey();
+			long current = entry.getValue();
+			long targetForPlayer = config.targetBalancePerPlayer;
+			if (current <= targetForPlayer) continue;
+			long available = current - targetForPlayer;
+			long burn = available * ratePercent / 100L;
+			if (burn < 1L) burn = 1L;
+			if (burn > available) burn = available;
+			if (burned + burn > toBurn) burn = toBurn - burned;
+			if (burn <= 0L) continue;
+			balances.put(id, current - burn);
+			burned += burn;
+		}
+		if (burned > 0L) markDirty();
+		return burned;
+	}
+
 	/* ---------- registro transazioni ---------- */
 
 	public void log(
@@ -170,7 +356,8 @@ public final class EconomyStore {
 		UUID targetId,
 		String targetName,
 		long amount,
-		long balanceAfter
+		long balanceAfter,
+		long fee
 	) {
 		Transaction transaction = new Transaction();
 		transaction.time = System.currentTimeMillis();
@@ -181,6 +368,7 @@ public final class EconomyStore {
 		transaction.targetName = targetName;
 		transaction.amount = amount;
 		transaction.balanceAfter = balanceAfter;
+		transaction.fee = fee;
 
 		transactions.add(0, transaction);
 		while (transactions.size() > config.transactionLogLimit) {
@@ -380,6 +568,7 @@ public final class EconomyStore {
 		String targetName;
 		long amount;
 		long balanceAfter;
+		long fee;
 
 		public boolean involves(UUID id, String name) {
 			boolean idMatch =
@@ -422,6 +611,10 @@ public final class EconomyStore {
 
 		public long balanceAfter() {
 			return balanceAfter;
+		}
+
+		public long fee() {
+			return fee;
 		}
 	}
 }

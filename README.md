@@ -41,6 +41,17 @@ Il file viene creato automaticamente in `config/moneta.json`:
 - `transactionLogLimit`: numero massimo di transazioni conservate.
 - `autosaveSeconds`: intervallo di salvataggio automatico; `0` salva subito dopo ogni modifica.
 
+### Politica monetaria
+- `regulationEnabled`: abilita la regolazione automatica della massa monetaria.
+- `targetBalancePerPlayer`: saldo medio desiderato per account noto.
+- `regulationIntervalSeconds`: intervallo tra due regolazioni automatiche.
+- `regulationTolerancePercent`: scarto percentuale consentito prima di intervenire.
+- `regulationRatePercent`: intensità della correzione (creazione o bruciatura).
+- `transactionTaxPercent`: tassa percentuale applicata ai trasferimenti.
+- `maxBalance`: saldo massimo per account; `0` disabilita il limite.
+- `mintCooldownSeconds`: raffreddamento del comando `/mint`.
+- `mintDailyLimit`: limite giornaliero del comando `/mint`; `0` disabilita.
+
 ## Dati
 
 I dati sono salvati nella cartella del mondo:
