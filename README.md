@@ -13,6 +13,7 @@ It does not need to be installed on clients: it adds persistent balances, paymen
 - Maximum balance cap.
 - Economy overview with circulation total and top balances.
 - Administrative commands for setting, taking, and auditing balances.
+- Payment requests between online and offline players, with accept/deny commands and reminders.
 - JSON configuration with sensible defaults.
 - Atomic saves on a background thread.
 - No HUD: balances are shown only through commands.
@@ -44,6 +45,12 @@ It does not need to be installed on clients: it adds persistent balances, paymen
 | `/setbalance <player> <amount>` | Sets a player's balance. Admin only. |
 | `/takebalance <player> <amount>` | Removes money from a player's balance. Admin only. |
 | `/transactions [player] [limit]` | Shows recent transactions. Admin only. |
+| `/request <player> <amount>` | Requests money from an online or offline player. |
+| `/requests` | Lists your pending payment requests. |
+| `/accept <player>` | Accepts a pending request from a player. |
+| `/acceptall` | Accepts all your pending requests. |
+| `/deny <player>` | Denies a pending request from a player. |
+| `/denyall` | Denies all your pending requests. |
 | `/treasury` | Shows the mint/treasury balance. |
 | `/settax <percent>` | Sets the transaction tax percentage. Admin only. |
 | `/treasurypay <player> <amount>` | Pays a player from the treasury. Admin only. |
@@ -71,7 +78,11 @@ The file is created automatically at `config/moneta.json`:
   "transactionTaxPercent": 5,
   "maxBalance": 100000,
   "mintCooldownSeconds": 60,
-  "mintDailyLimit": 100000
+  "mintDailyLimit": 100000,
+  "requestsEnabled": true,
+  "requestReminderIntervalSeconds": 300,
+  "requestReminderOnJoin": true,
+  "requestMaxPendingPerPayer": 10
 }
 ```
 
@@ -97,6 +108,13 @@ The file is created automatically at `config/moneta.json`:
 - `mintCooldownSeconds`: cooldown for `/mint`.
 - `mintDailyLimit`: daily limit for `/mint`. `0` disables the limit.
 
+### Payment requests
+
+- `requestsEnabled`: enables payment requests.
+- `requestReminderIntervalSeconds`: interval between pending-request reminders. `0` disables periodic reminders.
+- `requestReminderOnJoin`: reminds players about pending requests when they join.
+- `requestMaxPendingPerPayer`: maximum pending requests a player can receive. `0` disables the limit.
+
 ## Monetary policy
 
 Moneta includes a self-regulating monetary system:
@@ -110,6 +128,18 @@ Moneta includes a self-regulating monetary system:
 
 This keeps the currency from losing value through uncontrolled inflation while still allowing the economy to grow with the player base.
 
+## Payment requests
+
+A player can request money from another player, whether they are online or offline:
+
+```text
+/request Steve 250
+```
+
+The payer is notified immediately when online and receives a reminder when joining the server. Pending requests are also reminded periodically according to `requestReminderIntervalSeconds`. The payer can inspect, accept, or deny requests with `/requests`, `/accept <player>`, `/acceptall`, `/deny <player>`, and `/denyall`.
+
+When a request is accepted, the amount is transferred normally and the configured transaction tax applies. Requests are stored in `world/moneta/requests.json`.
+
 ## Treasury
 
 Transaction taxes are not burned: they are stored in the **mint treasury**.  
@@ -121,8 +151,9 @@ Example: if a free food service is funded by the treasury, the food can be purch
 
 Data is stored in the world folder:
 
-- `world/moneta/balances.json` — player balances and names.
+- `world/moneta/balances.json` — player balances, names, and treasury balance.
 - `world/moneta/transactions.json` — transaction history.
+- `world/moneta/requests.json` — pending payment requests.
 
 Saves use atomic file writes and are performed on a background thread to avoid blocking the server thread.
 

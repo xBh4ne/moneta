@@ -34,6 +34,12 @@ public final class MonetaConfig {
 	public int mintCooldownSeconds = 60;
 	public long mintDailyLimit = 100000L;
 
+	/* Richieste di denaro */
+	public boolean requestsEnabled = true;
+	public int requestReminderIntervalSeconds = 300;
+	public boolean requestReminderOnJoin = true;
+	public int requestMaxPendingPerPayer = 10;
+
 	private transient Permission adminPermissionValue =
 		Permissions.COMMANDS_GAMEMASTER;
 
@@ -96,6 +102,10 @@ public final class MonetaConfig {
 		if (maxBalance < 0L) maxBalance = 0L;
 		if (mintCooldownSeconds < 0) mintCooldownSeconds = 0;
 		if (mintDailyLimit < 0L) mintDailyLimit = 0L;
+		if (requestReminderIntervalSeconds < 0) {
+			requestReminderIntervalSeconds = 0;
+		}
+		if (requestMaxPendingPerPayer < 0) requestMaxPendingPerPayer = 0;
 
 		String permission = adminPermission == null
 			? ""

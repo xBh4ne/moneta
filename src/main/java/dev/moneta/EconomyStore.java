@@ -34,12 +34,14 @@ public final class EconomyStore {
 	private final Logger log;
 	private final Path balancesPath;
 	private final Path transactionsPath;
+	private final Path requestsPath;
 	private final MonetaConfig config;
 	private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
 	private final Map<UUID, Long> balances = new HashMap<>();
 	private final Map<UUID, String> names = new HashMap<>();
 	private final List<Transaction> transactions = new ArrayList<>();
+	private final List<PaymentRequest> requests = new ArrayList<>();
 	private long treasuryBalance;
 
 	private long lastMintTime;
@@ -59,15 +61,18 @@ public final class EconomyStore {
 	public EconomyStore(
 		Path balancesPath,
 		Path transactionsPath,
+		Path requestsPath,
 		MonetaConfig config,
 		Logger log
 	) {
 		this.balancesPath = balancesPath;
 		this.transactionsPath = transactionsPath;
+		this.requestsPath = requestsPath;
 		this.config = config;
 		this.log = log;
 		loadBalances();
 		loadTransactions();
+		loadRequests();
 	}
 
 	/* ---------- saldi ---------- */
@@ -381,6 +386,81 @@ public final class EconomyStore {
 		markDirty();
 	}
 
+	/* ---------- richieste di denaro ---------- */
+
+	public List<PaymentRequest> requestsForPayer(UUID payer) {
+		List<PaymentRequest> result = new ArrayList<>();
+		for (PaymentRequest request : requests) {
+			if (request.isPayer(payer)) result.add(request);
+		}
+		result.sort(
+			Comparator.comparingLong(PaymentRequest::createdAt)
+		);
+		return result;
+	}
+
+	public PaymentRequest findRequest(UUID payer, UUID requester) {
+		for (PaymentRequest request : requests) {
+			if (request.isPayer(payer) && request.isRequester(requester)) {
+				return request;
+			}
+		}
+		return null;
+	}
+
+	public int pendingCount(UUID payer) {
+		int count = 0;
+		for (PaymentRequest request : requests) {
+			if (request.isPayer(payer)) count++;
+		}
+		return count;
+	}
+
+	public long pendingTotal(UUID payer) {
+		long total = 0L;
+		for (PaymentRequest request : requests) {
+			if (!request.isPayer(payer)) continue;
+			if (Long.MAX_VALUE - total < request.amount()) return Long.MAX_VALUE;
+			total += request.amount();
+		}
+		return total;
+	}
+
+	public void addRequest(
+		UUID requesterId,
+		String requesterName,
+		UUID payerId,
+		String payerName,
+		long amount
+	) {
+		PaymentRequest request = new PaymentRequest();
+		request.requester = requesterId.toString();
+		request.requesterName = requesterName;
+		request.payer = payerId.toString();
+		request.payerName = payerName;
+		request.amount = amount;
+		request.createdAt = System.currentTimeMillis();
+		requests.add(request);
+		markDirty();
+	}
+
+	public boolean removeRequest(PaymentRequest request) {
+		boolean removed = requests.remove(request);
+		if (removed) markDirty();
+		return removed;
+	}
+
+	public int removeAllForPayer(UUID payer) {
+		List<PaymentRequest> toRemove = requestsForPayer(payer);
+		requests.removeAll(toRemove);
+		if (!toRemove.isEmpty()) markDirty();
+		return toRemove.size();
+	}
+
+	public List<PaymentRequest> allRequests() {
+		return Collections.unmodifiableList(requests);
+	}
+
 	/* ---------- registro transazioni ---------- */
 
 	public void log(
@@ -430,9 +510,10 @@ public final class EconomyStore {
 		dirty = false;
 		String balancesJson = balancesJson();
 		String transactionsJson = transactionsJson();
+		String requestsJson = requestsJson();
 		writer.execute(() -> {
 			try {
-				writeBoth(balancesJson, transactionsJson);
+				writeAll(balancesJson, transactionsJson, requestsJson);
 			} catch (Exception e) {
 				dirty = true;
 				log.error("Moneta: salvataggio fallito: {}", e.toString());
@@ -443,7 +524,7 @@ public final class EconomyStore {
 	public void saveNow() {
 		dirty = false;
 		try {
-			writeBoth(balancesJson(), transactionsJson());
+			writeAll(balancesJson(), transactionsJson(), requestsJson());
 		} catch (Exception e) {
 			dirty = true;
 			log.error("Moneta: salvataggio fallito: {}", e.toString());
@@ -462,11 +543,15 @@ public final class EconomyStore {
 		saveNow();
 	}
 
-	private void writeBoth(String balancesJson, String transactionsJson)
-		throws IOException {
+	private void writeAll(
+		String balancesJson,
+		String transactionsJson,
+		String requestsJson
+	) throws IOException {
 		synchronized (writeLock) {
 			writeAtomic(balancesPath, balancesJson);
 			writeAtomic(transactionsPath, transactionsJson);
+			writeAtomic(requestsPath, requestsJson);
 		}
 	}
 
@@ -510,6 +595,16 @@ public final class EconomyStore {
 			array.add(gson.toJsonTree(transaction));
 		}
 		root.add("transactions", array);
+		return gson.toJson(root);
+	}
+
+	private String requestsJson() {
+		JsonObject root = new JsonObject();
+		JsonArray array = new JsonArray();
+		for (PaymentRequest request : requests) {
+			array.add(gson.toJsonTree(request));
+		}
+		root.add("requests", array);
 		return gson.toJson(root);
 	}
 
@@ -577,6 +672,29 @@ public final class EconomyStore {
 		}
 	}
 
+	private void loadRequests() {
+		if (!Files.exists(requestsPath)) return;
+		try (Reader reader = Files.newBufferedReader(
+			requestsPath,
+			StandardCharsets.UTF_8
+		)) {
+			JsonObject root = JsonParser.parseReader(reader).getAsJsonObject();
+			if (!root.has("requests") || !root.get("requests").isJsonArray()) {
+				return;
+			}
+			for (JsonElement element : root.getAsJsonArray("requests")) {
+				PaymentRequest request = gson.fromJson(element, PaymentRequest.class);
+				if (request == null || request.amount <= 0L) continue;
+				requests.add(request);
+				rememberName(request.requester, request.requesterName);
+				rememberName(request.payer, request.payerName);
+			}
+		} catch (Exception e) {
+			backupCorrupt(requestsPath);
+			log.error("Moneta: richieste non leggibili: {}", e.toString());
+		}
+	}
+
 	private void rememberName(String rawId, String name) {
 		if (rawId == null || name == null) return;
 		try {
@@ -595,6 +713,57 @@ public final class EconomyStore {
 			log.warn("Moneta: copia di backup creata in {}", backup.getFileName());
 		} catch (Exception e) {
 			log.error("Moneta: impossibile creare il backup: {}", e.toString());
+		}
+	}
+
+	public static final class PaymentRequest {
+
+		String requester;
+		String requesterName;
+		String payer;
+		String payerName;
+		long amount;
+		long createdAt;
+
+		public UUID requesterId() {
+			return uuid(requester);
+		}
+
+		public UUID payerId() {
+			return uuid(payer);
+		}
+
+		public String requesterName() {
+			return requesterName;
+		}
+
+		public String payerName() {
+			return payerName;
+		}
+
+		public long amount() {
+			return amount;
+		}
+
+		public long createdAt() {
+			return createdAt;
+		}
+
+		public boolean isPayer(UUID id) {
+			return id != null && id.toString().equals(payer);
+		}
+
+		public boolean isRequester(UUID id) {
+			return id != null && id.toString().equals(requester);
+		}
+
+		private static UUID uuid(String raw) {
+			if (raw == null) return null;
+			try {
+				return UUID.fromString(raw);
+			} catch (IllegalArgumentException e) {
+				return null;
+			}
 		}
 	}
 

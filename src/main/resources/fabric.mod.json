@@ -3,7 +3,7 @@
   "id": "moneta",
   "version": "${version}",
   "name": "Moneta",
-  "description": "Server-side currency mod: persistent balances, offline transfers, admin commands, transaction log and configuration.",
+  "description": "Server-side currency mod: persistent balances, offline transfers, payment requests, treasury, admin commands, transaction log and automatic monetary policy.",
   "authors": ["xBh4ne"],
   "license": "MIT",
   "environment": "server",
